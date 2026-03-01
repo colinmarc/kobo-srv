@@ -1,0 +1,21 @@
+[package]
+name = "kobo-srv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+epub = "2"
+http = "1"
+matchit = "0.9"
+notify = "8"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = { version = "0.12", features = ["ssl-rustls"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+uuid = { version = "1", features = ["v5", "serde"] }
