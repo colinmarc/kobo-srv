@@ -11,14 +11,13 @@ use clap::Parser;
 use epub::doc::EpubDoc;
 use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
-use tiny_http::{Header, Method, Request, Response, SslConfig};
+use tiny_http::{Header, Request, Response, SslConfig};
 use uuid::Uuid;
 
-// Uuid::new_v5(&Uuid::NAMESPACE_URL, b"kobo-srv")
-const NAMESPACE: Uuid = uuid::uuid!("0e7374af-0579-51c5-ac74-71b641de543f");
+// Uuid::new_v5(&Uuid::NAMESPACE_URL, b"colinmarc/kobo-srv")
+const NAMESPACE: Uuid = uuid::uuid!("32536825-6dfc-5597-b4cb-4c896cdd8c4e");
 
 const KOBO_SYNC_TOKEN: http::HeaderName = http::HeaderName::from_static("x-kobo-synctoken");
-const KOBO_API_TOKEN: http::HeaderName = http::HeaderName::from_static("x-kobo-apitoken");
 const CONTENT_TYPE_JSON: http::HeaderValue =
     http::HeaderValue::from_static("application/json; charset=utf-8");
 const CONTENT_TYPE_EPUB: http::HeaderValue = http::HeaderValue::from_static("application/epub+zip");
@@ -32,6 +31,11 @@ struct Cli {
     /// The address to bind. Defaults to 0.0.0.0:8080.
     #[arg(long, default_value = "0.0.0.0:8080")]
     bind: SocketAddr,
+    /// The address to use in responses. This will be used to e.g. construct
+    /// download URLs for books, and should match the api_endpoint you
+    /// configured on your kobo.
+    #[arg(long)]
+    external_url: Option<http::Uri>,
     /// Path to TLS certificate (PEM).
     #[arg(long, requires = "tls_key")]
     tls_cert: Option<PathBuf>,
@@ -56,24 +60,20 @@ struct Book {
 
 struct Server {
     books: RwLock<BTreeMap<Uuid, Book>>,
-    resources: serde_json::Value,
     salt: String,
-    bind_port: u16,
+    external_uri: http::Uri,
 }
 
 impl Server {
-    fn new(bind_port: u16) -> Self {
-        let resources = serde_json::from_str(include_str!("resources.json")).unwrap();
-
+    fn new(external_url: http::Uri) -> Self {
         // We "salt" our continuation tokens so that we treat a continuation
         // token from another instance of the server as a fresh sync.
         let salt = format!("{:08x}", rand::random::<u32>());
 
         Self {
             books: RwLock::new(BTreeMap::new()),
-            resources,
             salt,
-            bind_port,
+            external_uri: external_url,
         }
     }
 }
@@ -128,7 +128,11 @@ struct BookMetadata<'a> {
 }
 
 impl<'a> BookMetadata<'a> {
-    fn new(id: Uuid, book: &'a Book, download_url: String) -> Self {
+    fn new(id: Uuid, book: &'a Book, external_url: &http::Uri) -> Self {
+        let base = external_url.to_string();
+        let base = base.trim_end_matches('/');
+        let download_url = format!("{base}/download/{id}");
+
         BookMetadata {
             contributor_roles: ContributorRole { name: &book.author },
             cover_image_id: id,
@@ -179,42 +183,11 @@ struct DownloadUrl<'a> {
     platform: &'a str,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct StateUpdateResponse<'a> {
-    request_result: &'a str,
-    update_results: &'a [()],
-}
-
 fn find_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
     req.headers()
         .iter()
         .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
         .map(|h| h.value.as_str())
-}
-
-fn external_base_url(req: &Request, bind_port: u16) -> String {
-    let forwarded = find_header(req, "x-forwarded-host").is_some();
-    let scheme = find_header(req, "x-forwarded-proto").unwrap_or("http");
-    let prefix = find_header(req, "x-forwarded-prefix").unwrap_or("");
-
-    let host = find_header(req, "x-forwarded-host")
-        .or_else(|| find_header(req, "host"))
-        .unwrap_or("localhost");
-
-    // If we're behind a reverse proxy, trust the forwarded host as-is.
-    // Otherwise the Kobo tends to omit the port from Host, so append
-    // the bind port if needed.
-    if forwarded || host.contains(':') {
-        format!("{scheme}://{host}{prefix}")
-    } else {
-        let default_port = if scheme == "https" { 443 } else { 80 };
-        if bind_port == default_port {
-            format!("{scheme}://{host}{prefix}")
-        } else {
-            format!("{scheme}://{host}:{bind_port}{prefix}")
-        }
-    }
 }
 
 fn json_response(value: impl Serialize) -> anyhow::Result<Response<io::Cursor<Vec<u8>>>> {
@@ -234,30 +207,6 @@ fn err_response(status: u16, msg: &str) -> Response<io::Cursor<Vec<u8>>> {
 
 type Handler = fn(&Server, Request, matchit::Params) -> anyhow::Result<()>;
 
-fn handle_initialization(
-    server: &Server,
-    req: Request,
-    _params: matchit::Params,
-) -> anyhow::Result<()> {
-    let resp = json_response(serde_json::json!({ "Resources": &server.resources }))?
-        .with_header(Header::from_bytes(KOBO_API_TOKEN.as_str(), "e30=").unwrap());
-
-    Ok(req.respond(resp)?)
-}
-
-fn handle_state_update(
-    _server: &Server,
-    req: Request,
-    _params: matchit::Params,
-) -> anyhow::Result<()> {
-    req.respond(json_response(StateUpdateResponse {
-        request_result: "Success",
-        update_results: &[],
-    })?)?;
-
-    Ok(())
-}
-
 fn decode_sync_token(req: &Request, salt: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let raw = find_header(req, KOBO_SYNC_TOKEN.as_str())?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
@@ -275,7 +224,6 @@ fn encode_sync_token(salt: &str, t: &chrono::DateTime<chrono::Utc>) -> String {
 }
 
 fn handle_sync(server: &Server, req: Request, _params: matchit::Params) -> anyhow::Result<()> {
-    let base = external_base_url(&req, server.bind_port);
     let since = decode_sync_token(&req, &server.salt);
     let now = chrono::Utc::now();
 
@@ -302,7 +250,7 @@ fn handle_sync(server: &Server, req: Request, _params: matchit::Params) -> anyho
                 revision_id: id,
                 status: "Active",
             },
-            book_metadata: BookMetadata::new(id, book, format!("{base}/download/{id}")),
+            book_metadata: BookMetadata::new(id, book, &server.external_uri),
         };
 
         if is_new {
@@ -314,7 +262,7 @@ fn handle_sync(server: &Server, req: Request, _params: matchit::Params) -> anyho
         }
     }
 
-    tracing::trace!(new = count_new, changed = count_changed, "syncing");
+    tracing::debug!(new = count_new, changed = count_changed, "syncing");
 
     let token = encode_sync_token(&server.salt, &now);
     let resp = json_response(items)?
@@ -324,16 +272,16 @@ fn handle_sync(server: &Server, req: Request, _params: matchit::Params) -> anyho
 
 fn handle_metadata(server: &Server, req: Request, params: matchit::Params) -> anyhow::Result<()> {
     let id: Uuid = params.get("id").unwrap().parse()?;
-    let base = external_base_url(&req, server.bind_port);
 
     let books = server.books.read().unwrap();
     let resp = match books.get(&id) {
         Some(book) => {
-            let metadata = BookMetadata::new(id, book, format!("{base}/download/{id}"));
+            let metadata = BookMetadata::new(id, book, &server.external_uri);
             json_response([metadata])?
         }
         None => err_response(404, "not found"),
     };
+
     Ok(req.respond(resp)?)
 }
 
@@ -382,7 +330,10 @@ fn handle_download(server: &Server, req: Request, params: matchit::Params) -> an
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_target(false)
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -391,7 +342,18 @@ fn main() -> anyhow::Result<()> {
         bail!("{} is not a directory", cli.dir.display());
     }
 
-    let server = Arc::new(Server::new(cli.bind.port()));
+    let scheme = if cli.tls_cert.is_some() && cli.tls_key.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+
+    let external_uri = match cli.external_url {
+        Some(url) => url,
+        None => format!("{scheme}://{}", cli.bind).parse()?,
+    };
+
+    let server = Arc::new(Server::new(external_uri.clone()));
     let dir = cli.dir.clone();
     let server_clone = server.clone();
     std::thread::spawn(move || {
@@ -419,17 +381,15 @@ fn main() -> anyhow::Result<()> {
     }
     .map_err(|e| anyhow::anyhow!("Failed to start server: {}", e))?;
 
+    let base_path = external_uri.path();
+
     let mut get = matchit::Router::new();
-    get.insert("/v1/initialization", handle_initialization as Handler)?;
     get.insert("/v1/library/sync", handle_sync as Handler)?;
     get.insert("/v1/library/{id}/metadata", handle_metadata as Handler)?;
     get.insert("/image/{id}/{*rest}", handle_image as Handler)?;
     get.insert("/download/{id}", handle_download as Handler)?;
 
-    let mut put = matchit::Router::new();
-    put.insert("/v1/library/{id}/state", handle_state_update as Handler)?;
-
-    tracing::info!("listening on {}", cli.bind);
+    tracing::info!("listening on {scheme}://{}", cli.bind);
 
     for req in http.incoming_requests() {
         let Ok(uri) = req.url().parse::<http::Uri>() else {
@@ -440,15 +400,14 @@ fn main() -> anyhow::Result<()> {
         let path = uri.path();
         tracing::info!("{} {}", req.method(), path);
 
-        let matched = match req.method() {
-            Method::Get => get.at(path).ok(),
-            Method::Put => put.at(path).ok(),
-            _ => None,
-        };
+        let path = path
+            .strip_prefix(base_path.strip_suffix("/").unwrap_or(base_path))
+            .unwrap_or(path);
 
-        let result = match matched {
+        let result = match get.at(path).ok() {
             Some(m) => (m.value)(&server, req, m.params),
             None => {
+                tracing::debug!(path = req.url(), "unhandled path");
                 let _ = req.respond(json_response(serde_json::json!({}))?);
                 Ok(())
             }
